@@ -10,13 +10,32 @@ const PORT = process.env.PORT || 8080;
 
 app.get('/', (req, res) => res.send('Boomflix Proxy is Online!'));
 
-// 1. Scraper Route (Includes TV Show support, IMDB mapping, and aggressive clicking)
+// ==========================================
+// 1. HELPER: STREAMWISH DECODER
+// ==========================================
+function unpack(packed) {
+    const regex = /eval\(function\(p,a,c,k,e,d\).*?return p\}\('(.*?)', *(\d+), *(\d+), *'(.*?)'\.split\('\|'\).*?\)\)/;
+    const match = packed.match(regex);
+    if (!match) return null;
+    let p = match[1];
+    let a = parseInt(match[2]);
+    let c = parseInt(match[3]);
+    let k = match[4].split('|');
+    const e = function(c) {
+        return (c < a ? '' : e(parseInt(c / a))) + ((c = c % a) > 35 ? String.fromCharCode(c + 29) : c.toString(36));
+    };
+    while (c--) { if (k[c]) { p = p.replace(new RegExp('\\b' + e(c) + '\\b', 'g'), k[c]); } }
+    return p;
+}
+
+
+// ==========================================
+// 2. EXISTING ROUTE: VIDKING EXTRACTOR
+// ==========================================
 app.get('/extract', async (req, res) => {
-    // Note: The frontend now passes the IMDB ID here (e.g. tt1234567) to prevent wrong movies
     const { tmdbId, type, season, episode } = req.query;
     if (!tmdbId) return res.status(400).json({ error: "Missing ID" });
 
-    // Automatically build the correct URL for either Movies or TV Shows
     let targetUrl = `https://www.vidking.net/embed/movie/${tmdbId}`;
     if (type === 'tv') {
         targetUrl = `https://www.vidking.net/embed/tv/${tmdbId}/${season || 1}/${episode || 1}`;
@@ -35,21 +54,15 @@ app.get('/extract', async (req, res) => {
         await page.setRequestInterception(true);
         page.on('request', (request) => {
             const url = request.url();
-            // Capture the master playlist
             if (url.includes('.m3u8')) {
                 m3u8Url = url;
             }
             request.continue();
         });
 
-        // Use domcontentloaded to prevent timing out on endless ad networks
         await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
-        
-        // Wait 3 seconds for the page structure to settle
         await new Promise(r => setTimeout(r, 3000));
 
-        // AGGRESSIVE CLICKING: Click the center of the screen 4 times with a delay 
-        // to smash through any invisible pop-up ad overlays!
         for (let i = 0; i < 4; i++) {
             try {
                 await page.mouse.click(page.viewport().width / 2, page.viewport().height / 2);
@@ -57,7 +70,6 @@ app.get('/extract', async (req, res) => {
             } catch(e) {}
         }
 
-        // Wait up to 10 extra seconds specifically for the m3u8 request to fire
         let waitLoops = 0;
         while (!m3u8Url && waitLoops < 10) {
             await new Promise(r => setTimeout(r, 1000));
@@ -78,7 +90,53 @@ app.get('/extract', async (req, res) => {
     }
 });
 
-// 2. Proxy Route (Includes smart URL rewriting to prevent broken quotation marks)
+
+// ==========================================
+// 3. NEW ROUTE: 2EMBED / STREAMWISH EXTRACTOR
+// ==========================================
+app.get('/extract-2embed', async (req, res) => {
+    const { tmdbId, type = 'movie', season = 1, episode = 1 } = req.query;
+    if (!tmdbId) return res.status(400).json({ success: false, error: 'tmdbId is required' });
+
+    try {
+        const embedUrl = type === 'tv' 
+            ? `https://www.2embed.cc/embedtv/${tmdbId}&s=${season}&e=${episode}` 
+            : `https://www.2embed.cc/embed/${tmdbId}`;
+            
+        const { data: embedHtml } = await axios.get(embedUrl, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+        });
+
+        const swishMatch = embedHtml.match(/swish\?id=([a-zA-Z0-9]+)/);
+        if (!swishMatch) return res.status(404).json({ success: false, error: 'StreamWish source not found' });
+        
+        const lockerUrl = `https://2vcdn.skin/e/${swishMatch[1]}`;
+        const { data: lockerHtml } = await axios.get(lockerUrl, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Referer': embedUrl }
+        });
+
+        const unpackedCode = unpack(lockerHtml);
+        if (!unpackedCode) return res.status(500).json({ success: false, error: 'Failed to unpack script' });
+
+        const fileMatch = unpackedCode.match(/["'](https?:\/\/[^"']+\.m3u8(?:[^"']+)?)["']/);
+        if (!fileMatch) return res.status(500).json({ success: false, error: 'Could not find .m3u8' });
+
+        return res.json({
+            success: true,
+            streamUrl: fileMatch[1],
+            source: 'streamwish',
+            provider: '2embed'
+        });
+
+    } catch (err) {
+        return res.status(500).json({ success: false, error: 'Scraping failed: ' + err.message });
+    }
+});
+
+
+// ==========================================
+// 4. EXISTING ROUTE: PROXY ENDPOINTS
+// ==========================================
 app.get('/proxy-playlist', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send("No url provided");
@@ -91,20 +149,17 @@ app.get('/proxy-playlist', async (req, res) => {
         const baseURL = new URL(targetUrl);
         let playlist = response.data;
         
-        // Smarter rewriting: handles relative URLs and protects quotation marks
         const lines = playlist.split('\n');
         for (let i = 0; i < lines.length; i++) {
             let line = lines[i].trim();
             if (line.length === 0) continue;
             
-            // Rewrite URI="..." links
             if (line.includes('URI="')) {
                 line = line.replace(/URI="([^"]+)"/, (match, uri) => {
                     const absoluteUri = new URL(uri, baseURL.href).href;
                     return `URI="https://${req.get('host')}/proxy-chunk?url=${encodeURIComponent(absoluteUri)}"`;
                 });
             }
-            // Rewrite direct video chunk links (lines that don't start with #)
             else if (!line.startsWith('#')) {
                 const absoluteUri = new URL(line, baseURL.href).href;
                 line = `https://${req.get('host')}/proxy-chunk?url=${encodeURIComponent(absoluteUri)}`;
@@ -134,19 +189,5 @@ app.get('/proxy-chunk', async (req, res) => {
     }
 });
 
+// START SERVER
 app.listen(PORT, () => console.log(`API running on port ${PORT}`));
-// StreamWish P.A.C.K.E.R decoder function
-function unpack(packed) {
-    const regex = /eval\(function\(p,a,c,k,e,d\).*?return p\}\('(.*?)', *(\d+), *(\d+), *'(.*?)'\.split\('\|'\).*?\)\)/;
-    const match = packed.match(regex);
-    if (!match) return null;
-    let p = match[1];
-    let a = parseInt(match[2]);
-    let c = parseInt(match[3]);
-    let k = match[4].split('|');
-    const e = function(c) {
-        return (c < a ? '' : e(parseInt(c / a))) + ((c = c % a) > 35 ? String.fromCharCode(c + 29) : c.toString(36));
-    };
-    while (c--) { if (k[c]) { p = p.replace(new RegExp('\\b' + e(c) + '\\b', 'g'), k[c]); } }
-    return p;
-}
