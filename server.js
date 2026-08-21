@@ -135,3 +135,18 @@ app.get('/proxy-chunk', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`API running on port ${PORT}`));
+// StreamWish P.A.C.K.E.R decoder function
+function unpack(packed) {
+    const regex = /eval\(function\(p,a,c,k,e,d\).*?return p\}\('(.*?)', *(\d+), *(\d+), *'(.*?)'\.split\('\|'\).*?\)\)/;
+    const match = packed.match(regex);
+    if (!match) return null;
+    let p = match[1];
+    let a = parseInt(match[2]);
+    let c = parseInt(match[3]);
+    let k = match[4].split('|');
+    const e = function(c) {
+        return (c < a ? '' : e(parseInt(c / a))) + ((c = c % a) > 35 ? String.fromCharCode(c + 29) : c.toString(36));
+    };
+    while (c--) { if (k[c]) { p = p.replace(new RegExp('\\b' + e(c) + '\\b', 'g'), k[c]); } }
+    return p;
+}
