@@ -35,17 +35,12 @@ app.get('/extract', async (req, res) => {
             request.continue();
         });
 
-        // Go to the embed page
         await page.goto(targetUrl, { waitUntil: 'networkidle2' });
 
-        // NEW: Simulate clicking the center of the screen to trigger the video!
         try {
             await page.mouse.click(page.viewport().width / 2, page.viewport().height / 2);
-            // Wait 5 seconds for the video request to fire after clicking
             await new Promise(r => setTimeout(r, 5000));
-        } catch(e) {
-            console.log("Click failed");
-        }
+        } catch(e) { }
 
         await browser.close();
 
@@ -53,7 +48,7 @@ app.get('/extract', async (req, res) => {
             const proxyUrl = `https://${req.get('host')}/proxy-playlist?url=${encodeURIComponent(m3u8Url)}`;
             res.json({ success: true, streamUrl: proxyUrl });
         } else {
-            res.status(404).json({ error: "Could not find video stream after clicking." });
+            res.status(404).json({ error: "Could not find video stream." });
         }
     } catch (error) {
         if (browser) await browser.close();
@@ -71,13 +66,33 @@ app.get('/proxy-playlist', async (req, res) => {
             headers: { 'Referer': 'https://www.vidking.net/' }
         });
         
+        const baseURL = new URL(targetUrl);
         let playlist = response.data;
-        playlist = playlist.replace(/(https?:\/\/[^\s]+)/g, match => {
-            return `https://${req.get('host')}/proxy-chunk?url=${encodeURIComponent(match)}`;
-        });
+        
+        // Smarter rewriting: handles relative URLs and protects quotation marks
+        const lines = playlist.split('\n');
+        for (let i = 0; i < lines.length; i++) {
+            let line = lines[i].trim();
+            if (line.length === 0) continue;
+            
+            // Rewrite URI="..." links
+            if (line.includes('URI="')) {
+                line = line.replace(/URI="([^"]+)"/, (match, uri) => {
+                    const absoluteUri = new URL(uri, baseURL.href).href;
+                    return `URI="https://${req.get('host')}/proxy-chunk?url=${encodeURIComponent(absoluteUri)}"`;
+                });
+            }
+            // Rewrite direct video chunk links (lines that don't start with #)
+            else if (!line.startsWith('#')) {
+                const absoluteUri = new URL(line, baseURL.href).href;
+                line = `https://${req.get('host')}/proxy-chunk?url=${encodeURIComponent(absoluteUri)}`;
+            }
+            
+            lines[i] = line;
+        }
 
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-        res.send(playlist);
+        res.send(lines.join('\n'));
     } catch (error) {
         res.status(500).send("Proxy error");
     }
