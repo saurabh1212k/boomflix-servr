@@ -12,12 +12,16 @@ app.get('/', (req, res) => res.send('Boomflix Proxy is Online!'));
 
 // 1. Scraper Route
 app.get('/extract', async (req, res) => {
-    const tmdbId = req.query.tmdbId;
+    const { tmdbId, type, season, episode } = req.query;
     if (!tmdbId) return res.status(400).json({ error: "Missing tmdbId" });
 
-    const targetUrl = `https://www.vidking.net/embed/movie/${tmdbId}`;
+    // Automatically build the correct URL for either Movies or TV Shows
+    let targetUrl = `https://www.vidking.net/embed/movie/${tmdbId}`;
+    if (type === 'tv') {
+        targetUrl = `https://www.vidking.net/embed/tv/${tmdbId}/${season || 1}/${episode || 1}`;
+    }
+
     let browser;
-    
     try {
         browser = await puppeteer.launch({
             headless: 'new',
