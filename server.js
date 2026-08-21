@@ -10,10 +10,11 @@ const PORT = process.env.PORT || 8080;
 
 app.get('/', (req, res) => res.send('Boomflix Proxy is Online!'));
 
-// 1. Scraper Route
+// 1. Scraper Route (Includes TV Show support, IMDB mapping, and aggressive clicking)
 app.get('/extract', async (req, res) => {
+    // Note: The frontend now passes the IMDB ID here (e.g. tt1234567) to prevent wrong movies
     const { tmdbId, type, season, episode } = req.query;
-    if (!tmdbId) return res.status(400).json({ error: "Missing tmdbId" });
+    if (!tmdbId) return res.status(400).json({ error: "Missing ID" });
 
     // Automatically build the correct URL for either Movies or TV Shows
     let targetUrl = `https://www.vidking.net/embed/movie/${tmdbId}`;
@@ -33,18 +34,35 @@ app.get('/extract', async (req, res) => {
 
         await page.setRequestInterception(true);
         page.on('request', (request) => {
-            if (request.url().includes('.m3u8')) {
-                m3u8Url = request.url();
+            const url = request.url();
+            // Capture the master playlist
+            if (url.includes('.m3u8')) {
+                m3u8Url = url;
             }
             request.continue();
         });
 
-        await page.goto(targetUrl, { waitUntil: 'networkidle2' });
+        // Use domcontentloaded to prevent timing out on endless ad networks
+        await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
+        
+        // Wait 3 seconds for the page structure to settle
+        await new Promise(r => setTimeout(r, 3000));
 
-        try {
-            await page.mouse.click(page.viewport().width / 2, page.viewport().height / 2);
-            await new Promise(r => setTimeout(r, 5000));
-        } catch(e) { }
+        // AGGRESSIVE CLICKING: Click the center of the screen 4 times with a delay 
+        // to smash through any invisible pop-up ad overlays!
+        for (let i = 0; i < 4; i++) {
+            try {
+                await page.mouse.click(page.viewport().width / 2, page.viewport().height / 2);
+                await new Promise(r => setTimeout(r, 1000));
+            } catch(e) {}
+        }
+
+        // Wait up to 10 extra seconds specifically for the m3u8 request to fire
+        let waitLoops = 0;
+        while (!m3u8Url && waitLoops < 10) {
+            await new Promise(r => setTimeout(r, 1000));
+            waitLoops++;
+        }
 
         await browser.close();
 
@@ -52,7 +70,7 @@ app.get('/extract', async (req, res) => {
             const proxyUrl = `https://${req.get('host')}/proxy-playlist?url=${encodeURIComponent(m3u8Url)}`;
             res.json({ success: true, streamUrl: proxyUrl });
         } else {
-            res.status(404).json({ error: "Could not find video stream." });
+            res.status(404).json({ error: "Could not find video stream. Blocked by ads or captcha." });
         }
     } catch (error) {
         if (browser) await browser.close();
@@ -60,7 +78,7 @@ app.get('/extract', async (req, res) => {
     }
 });
 
-// 2. Proxy Route
+// 2. Proxy Route (Includes smart URL rewriting to prevent broken quotation marks)
 app.get('/proxy-playlist', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send("No url provided");
